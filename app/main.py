@@ -341,39 +341,6 @@ def home():
     }
 
 
-@app.get("/test-ai")
-def test_ai():
-    """Open this in a browser to check if your Gemini API key is working."""
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if not api_key:
-        return {"status": "error", "reason": "GEMINI_API_KEY not set in environment variables."}
-    try:
-        r = requests.post(
-            f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent",
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json={"contents": [{"role": "user", "parts": [{"text": "Say hello in one sentence."}]}]},
-            timeout=30,
-        )
-        if r.status_code == 200:
-            return {"status": "ok", "model": GEMINI_MODEL, "reply": response_text(r.json())}
-        try:
-            err = r.json().get("error", {})
-        except Exception:
-            err = {}
-        return {
-            "status": "error",
-            "http_status": r.status_code,
-            "code": err.get("code"),
-            "message": err.get("message", r.text[:300]),
-            "fix": (
-                "Go to https://aistudio.google.com/apikey → Create API key → "
-                "update GEMINI_API_KEY on Render dashboard."
-            ),
-        }
-    except Exception as exc:
-        return {"status": "error", "reason": str(exc)}
-
-
 @app.get("/product/{barcode}")
 def get_product(barcode: str):
     if barcode in product_cache:
