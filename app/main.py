@@ -86,8 +86,8 @@ ADDITIVE_TERMS = [
     "aspartame",
 ]
 GOOD_TERMS = ["whole wheat", "oats", "millet", "ragi", "jowar", "bran", "fiber", "fibre", "protein", "lentil"]
-GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+OPENAI_API_BASE = "https://api.openai.com/v1"
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def health_score(product: dict[str, Any]) -> int:
@@ -252,130 +252,85 @@ def label_analysis(text: str, allergies: str = "") -> dict[str, Any]:
     return {"score": max(1, min(100, score)), "findings": findings}
 
 
-def response_text(data: dict[str, Any]) -> str:
-    parts: list[str] = []
-    for candidate in data.get("candidates") or []:
-        for part in (candidate.get("content") or {}).get("parts") or []:
-            text = part.get("text")
-            if isinstance(text, str):
-                parts.append(text)
-    return "\n".join(parts).strip()
-
-
-def retry_delay_seconds(data: dict[str, Any]) -> float | None:
-    for detail in (data.get("error") or {}).get("details") or []:
-        if detail.get("@type", "").endswith("RetryInfo"):
-            delay = str(detail.get("retryDelay") or "")
-            match = re.match(r"([\d.]+)s", delay)
-            if match:
-                return float(match.group(1))
-
-    message = str((data.get("error") or {}).get("message") or "")
-    match = re.search(r"retry in ([\d.]+)s", message, re.IGNORECASE)
-    return float(match.group(1)) if match else None
-
-
-def generate_gemini(contents: list[dict[str, Any]], profile: dict[str, Any] | None) -> str:
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Chat is not configured. Add GEMINI_API_KEY to backend/.env and restart the backend.",
-        )
-
-    profile = profile or {}
-    profile_context = (
-        f"Name: {profile.get('name', 'User')}; "
-        f"relationship: {profile.get('relationship', 'self')}; "
+def build_system_prompt(profile: dict[str, Any]) -> str:
+    return (
+        "You are Nutri Ninja, a concise and friendly nutrition assistant. "
+        "Give practical food, ingredient, grocery, and label guidance. "
+        "Respect the user's allergies and dietary goals. Do not diagnose or replace a clinician. "
+        "For urgent health symptoms, advise professional care. "
+        "Keep answers under 150 words unless detail is requested. "
+        f"User profile — Name: {profile.get('name', 'User')}; "
         f"goal: {profile.get('goal', 'general')}; "
         f"dietary preferences: {', '.join(profile.get('restrictions') or []) or 'none'}; "
         f"allergies: {profile.get('allergies', 'none') or 'none'}; "
         f"conditions: {profile.get('conditions', 'none') or 'none'}; "
         f"ingredients to avoid: {profile.get('dislikedIngredients', 'none') or 'none'}."
     )
-    request_body = {
-        "system_instruction": {
-            "parts": [{
-                "text": (
-                    "You are Nutri Ninja, a concise and friendly nutrition assistant. "
-                    "Give practical food, ingredient, grocery, and label guidance. "
-                    "Respect the user's allergies and dietary goals. Do not diagnose or "
-                    "replace a clinician. For urgent symptoms, advise professional care. "
-                    "When audio is provided, understand it as the user's spoken question. "
-                    "Keep spoken-friendly answers under 140 words unless detail is requested. "
-                    f"Current user profile: {profile_context}"
-                )
-            }]
-        },
-        "contents": contents,
-        "generationConfig": {"maxOutputTokens": 350},
-    }
+
+
+def call_openai_chat(messages: list[dict[str, Any]], profile: dict[str, Any] | None) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="AI chat is not configured. Add OPENAI_API_KEY to Render environment variables.",
+        )
+
+    profile = profile or {}
+    openai_messages = [
+        {"role": "system", "content": build_system_prompt(profile)},
+        *[{"role": m["role"], "content": m["content"]} for m in messages if m.get("content", "").strip()],
+    ]
 
     try:
-        response = None
-        for attempt in range(3):
-            response = requests.post(
-                f"{GEMINI_API_BASE}/{GEMINI_MODEL}:generateContent",
-                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-                json=request_body,
-                timeout=60,
-            )
+        response = requests.post(
+            f"{OPENAI_API_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": OPENAI_MODEL, "messages": openai_messages, "max_tokens": 400},
+            timeout=60,
+        )
 
-            if response.status_code == 200:
-                break
+        if response.status_code == 200:
+            answer = response.json()["choices"][0]["message"]["content"].strip()
+            if not answer:
+                raise HTTPException(status_code=502, detail="OpenAI returned an empty response.")
+            return answer
 
-            if response.status_code == 429:
-                error_data = response.json()
-                delay = retry_delay_seconds(error_data)
-                if attempt < 2 and delay is not None and delay <= 15:
-                    time.sleep(delay + 0.5)
-                    continue
-                wait_seconds = max(1, round(delay or 30))
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"AI is busy right now. Please wait {wait_seconds} seconds and try again.",
-                )
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="AI is busy right now. Please try again in a moment.")
 
-            if response.status_code in (401, 403):
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Gemini API key is invalid or the Generative Language API is not enabled. "
-                        "Go to https://aistudio.google.com/apikey, create a new key, and update "
-                        "GEMINI_API_KEY in your Render environment variables."
-                    ),
-                )
-
-            if response.status_code == 404:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Gemini model '{GEMINI_MODEL}' not found. Set GEMINI_MODEL=gemini-1.5-flash in Render env vars.",
-                )
-
-            # Any other error — surface the Gemini message
-            try:
-                err_msg = response.json().get("error", {}).get("message", "")
-            except Exception:
-                err_msg = ""
+        if response.status_code in (401, 403):
             raise HTTPException(
-                status_code=502,
-                detail=f"Gemini error {response.status_code}: {err_msg or 'Unknown error'}",
+                status_code=503,
+                detail="OpenAI API key is invalid. Update OPENAI_API_KEY in Render environment variables.",
             )
 
-        assert response is not None
-        answer = response_text(response.json())
+        try:
+            err = response.json().get("error", {}).get("message", "")
+        except Exception:
+            err = ""
+        raise HTTPException(status_code=502, detail=f"OpenAI error {response.status_code}: {err or 'Unknown error'}")
 
     except HTTPException:
         raise
     except requests.RequestException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not reach Gemini API. Check your internet connection and try again.",
-        ) from exc
+        raise HTTPException(status_code=502, detail="Could not reach OpenAI. Check your internet connection.") from exc
 
-    if not answer:
-        raise HTTPException(status_code=502, detail="Gemini returned an empty response.")
-    return answer
+
+def transcribe_audio(audio_bytes: bytes, mime_type: str) -> str:
+    """Transcribe audio using OpenAI Whisper."""
+    import io
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    ext = "webm" if "webm" in mime_type else ("mp3" if "mp3" in mime_type else "wav")
+    response = requests.post(
+        f"{OPENAI_API_BASE}/audio/transcriptions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        files={"file": (f"audio.{ext}", io.BytesIO(audio_bytes), mime_type)},
+        data={"model": "whisper-1"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json().get("text", "").strip()
 
 
 @app.get("/")
@@ -476,17 +431,9 @@ def chat(payload: ChatPayload):
     if not messages or not messages[-1].content.strip():
         raise HTTPException(status_code=400, detail="A message is required.")
 
-    contents = [
-        {
-            "role": "model" if message.role == "assistant" else "user",
-            "parts": [{"text": message.content.strip()}],
-        }
-        for message in messages
-        if message.content.strip()
-    ]
-
-    answer = generate_gemini(contents, payload.profile)
-    return {"message": answer, "model": GEMINI_MODEL}
+    msgs = [{"role": m.role, "content": m.content.strip()} for m in messages if m.content.strip()]
+    answer = call_openai_chat(msgs, payload.profile)
+    return {"message": answer, "model": OPENAI_MODEL}
 
 
 @app.post("/chat/voice")
@@ -501,28 +448,15 @@ def voice_chat(payload: VoiceChatPayload):
     if len(audio_bytes) > 8 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Voice recording is too long. Keep it under one minute.")
 
-    history = [
-        {
-            "role": "model" if message.role == "assistant" else "user",
-            "parts": [{"text": message.content.strip()}],
-        }
-        for message in payload.messages[-8:]
-        if message.content.strip()
-    ]
-    history.append({
-        "role": "user",
-        "parts": [
-            {"text": "Listen to this voice message and answer the spoken question."},
-            {
-                "inline_data": {
-                    "mime_type": payload.mime_type,
-                    "data": payload.audio_base64,
-                }
-            },
-        ],
-    })
-    answer = generate_gemini(history, payload.profile)
-    return {"message": answer, "model": GEMINI_MODEL}
+    # Transcribe audio with Whisper, then answer with GPT
+    transcript = transcribe_audio(audio_bytes, payload.mime_type)
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Could not understand the audio. Please try speaking clearly.")
+
+    history = [{"role": m.role, "content": m.content.strip()} for m in payload.messages[-8:] if m.content.strip()]
+    history.append({"role": "user", "content": transcript})
+    answer = call_openai_chat(history, payload.profile)
+    return {"message": answer, "model": OPENAI_MODEL, "transcript": transcript}
 
 
 @app.post("/user/profile/{user_id}")
@@ -541,3 +475,33 @@ def get_profile(user_id: str):
 @app.get("/history")
 def history():
     return {"items": scan_history}
+
+
+@app.get("/test-ai")
+def test_ai():
+    """Open in browser to verify OpenAI API key is working."""
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return {"status": "error", "reason": "OPENAI_API_KEY not set in Render environment variables."}
+    try:
+        r = requests.post(
+            f"{OPENAI_API_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": OPENAI_MODEL, "messages": [{"role": "user", "content": "Say hello in one sentence."}], "max_tokens": 50},
+            timeout=30,
+        )
+        if r.status_code == 200:
+            reply = r.json()["choices"][0]["message"]["content"].strip()
+            return {"status": "ok", "model": OPENAI_MODEL, "reply": reply}
+        try:
+            err = r.json().get("error", {})
+        except Exception:
+            err = {}
+        return {
+            "status": "error",
+            "http_status": r.status_code,
+            "message": err.get("message", r.text[:300]),
+            "fix": "Update OPENAI_API_KEY in Render environment variables.",
+        }
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
